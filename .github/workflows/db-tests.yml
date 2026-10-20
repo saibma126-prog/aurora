@@ -1,0 +1,33 @@
+name: db-security-tests
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run migrations and security tests
+        run: |
+          psql -d postgres -c 'create database t'
+          export PGDATABASE=t
+          psql -q -v ON_ERROR_STOP=1 -f supabase/tests/stub_supabase.sql
+          psql -q -v ON_ERROR_STOP=1 -f supabase/migrations/0001_core_access_and_chat.sql
+          psql -q -v ON_ERROR_STOP=1 -f supabase/migrations/0002_device_trust_and_prekeys.sql
+          psql -f supabase/tests/security_tests.sql | tee out.txt
+          FAILED=$(psql -t -A -c "select count(*) from t.results where not ok")
+          TOTAL=$(psql -t -A -c "select count(*) from t.results")
+          echo "total=$TOTAL failed=$FAILED"
+          test "$FAILED" = "0" && test "$TOTAL" -gt 50
