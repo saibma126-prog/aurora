@@ -288,3 +288,221 @@ create table public.backups (
   sha256 text not null,
   created_at timestamptz not null default now()
 );
+
+-- ---------- Admin actions ----------
+create function public.admin_revoke_member(target uuid) returns void
+language plpgsql security definer set search_path = public, auth as $$
+begin
+  if not public.is_admin_aal2() then raise exception 'forbidden' using errcode = '42501'; end if;
+  if target = auth.uid() then raise exception 'cannot revoke self'; end if;
+  update allowed_emails set status = 'revoked' where email = (select email from profiles where id = target);
+  update profiles set status = 'revoked' where id = target;
+  update devices set revoked_at = now() where user_id = target and revoked_at is null;
+  delete from push_tokens where user_id = target;
+  update conversation_members set left_at = now() where user_id = target and left_at is null;
+  delete from auth.sessions where user_id = target;
+  perform public.log_audit('member.revoked', jsonb_build_object('target', target));
+end $$;
+revoke execute on function public.admin_revoke_member(uuid) from public, anon;
+grant  execute on function public.admin_revoke_member(uuid) to authenticated;
+
+create function public.admin_invite_member(p_email text, p_name text) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_admin_aal2() then raise exception 'forbidden' using errcode = '42501'; end if;
+  insert into allowed_emails(email, display_name, invited_by) values (lower(p_email)::citext, p_name, auth.uid())
+    on conflict (email) do update set display_name = excluded.display_name, status = 'invited';
+  perform public.log_audit('member.invited', jsonb_build_object('email', lower(p_email)));
+end $$;
+revoke execute on function public.admin_invite_member(text, text) from public, anon;
+grant  execute on function public.admin_invite_member(text, text) to authenticated;
+
+-- ---------- Conversation creation RPCs ----------
+create function public.create_direct_conversation(other uuid) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare cid uuid; k text;
+begin
+  if not public.is_active_member() then raise exception 'forbidden' using errcode = '42501'; end if;
+  if other = auth.uid() or not exists (select 1 from profiles where id = other and status = 'active' and role = 'member') then
+    raise exception 'invalid target'; end if;
+  if exists (select 1 from blocks where (blocker = other and blocked = auth.uid()) or (blocker = auth.uid() and blocked = other)) then
+    raise exception 'blocked'; end if;
+  k := least(auth.uid()::text, other::text) || ':' || greatest(auth.uid()::text, other::text);
+  select id into cid from conversations where direct_key = k;
+  if cid is null then
+    insert into conversations(kind, direct_key, created_by) values ('direct', k, auth.uid()) returning id into cid;
+    insert into conversation_members(conversation_id, user_id) values (cid, auth.uid()), (cid, other);
+  end if;
+  return cid;
+end $$;
+revoke execute on function public.create_direct_conversation(uuid) from public, anon;
+grant  execute on function public.create_direct_conversation(uuid) to authenticated;
+
+create function public.create_group(p_title text, p_members uuid[]) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare cid uuid; m uuid;
+begin
+  if not public.is_active_member() then raise exception 'forbidden' using errcode = '42501'; end if;
+  if coalesce(array_length(p_members,1),0) < 1 or array_length(p_members,1) > 63 then raise exception 'invalid member count'; end if;
+  insert into conversations(kind, title, created_by) values ('group', left(p_title, 80), auth.uid()) returning id into cid;
+  insert into conversation_members(conversation_id, user_id, role) values (cid, auth.uid(), 'owner');
+  foreach m in array p_members loop
+    if m <> auth.uid() and exists (select 1 from profiles where id = m and status = 'active' and role = 'member') then
+      insert into conversation_members(conversation_id, user_id) values (cid, m) on conflict do nothing;
+    end if;
+  end loop;
+  return cid;
+end $$;
+revoke execute on function public.create_group(text, uuid[]) from public, anon;
+grant  execute on function public.create_group(text, uuid[]) to authenticated;
+
+-- =====================================================================
+-- RLS: deny by default, then grant narrowly
+-- =====================================================================
+revoke all on all tables in schema public from anon, authenticated;
+do $$ declare t text; begin
+  for t in select tablename from pg_tables where schemaname='public' loop
+    execute format('alter table public.%I enable row level security', t);
+  end loop; end $$;
+
+grant select on public.allowed_emails, public.audit_log to authenticated;
+create policy ae_admin_read    on public.allowed_emails for select to authenticated using (public.is_admin_aal2());
+create policy audit_admin_read on public.audit_log      for select to authenticated using (public.is_admin_aal2());
+
+grant select (id, display_name, dp_path) on public.profiles to authenticated;
+grant update (dp_path, show_last_seen, hide_lock_preview) on public.profiles to authenticated;
+create policy prof_select on public.profiles for select to authenticated
+  using (id = auth.uid() or public.is_admin() or (public.is_active_member() and role = 'member' and status = 'active'));
+create policy prof_update_self on public.profiles for update to authenticated
+  using (id = auth.uid() and status = 'active') with check (id = auth.uid());
+
+grant select, insert, update on public.devices to authenticated;
+create policy dev_select on public.devices for select to authenticated
+  using (public.is_active_member() and (user_id = auth.uid() or exists (
+    select 1 from conversation_members a join conversation_members b on a.conversation_id = b.conversation_id
+    where a.user_id = auth.uid() and b.user_id = devices.user_id and a.left_at is null and b.left_at is null)));
+create policy dev_insert on public.devices for insert to authenticated
+  with check (user_id = auth.uid() and public.is_active_member() and approved_at is null and revoked_at is null);
+create policy dev_update_self on public.devices for update to authenticated
+  using (user_id = auth.uid()) with check (user_id = auth.uid());
+-- TODO(0002): column-restrict device updates (users must not self-approve) + approval RPC from an existing approved device.
+
+grant select, insert, delete on public.device_prekeys to authenticated;
+create policy pk_own on public.device_prekeys for all to authenticated
+  using (exists (select 1 from devices d where d.id = device_id and d.user_id = auth.uid()))
+  with check (exists (select 1 from devices d where d.id = device_id and d.user_id = auth.uid()));
+-- TODO(0002): atomic claim_prekey RPC so one-time prekeys are consumed once.
+
+grant select, insert, update, delete on public.push_tokens to authenticated;
+create policy push_own on public.push_tokens for all to authenticated
+  using (user_id = auth.uid() and public.is_active_member()) with check (user_id = auth.uid() and public.is_active_member());
+
+grant select on public.conversations to authenticated;
+create policy conv_select on public.conversations for select to authenticated using (public.is_conv_member(id));
+grant select on public.conversation_members to authenticated;
+grant update (muted_until, pinned, archived) on public.conversation_members to authenticated;
+create policy cm_select on public.conversation_members for select to authenticated using (public.is_conv_member(conversation_id));
+create policy cm_update_self on public.conversation_members for update to authenticated
+  using (user_id = auth.uid() and public.is_active_member()) with check (user_id = auth.uid());
+
+grant select, insert, delete on public.blocks to authenticated;
+create policy blocks_own on public.blocks for all to authenticated
+  using (blocker = auth.uid() and public.is_active_member()) with check (blocker = auth.uid() and public.is_active_member());
+grant select, insert on public.reports to authenticated;
+create policy rep_insert on public.reports for insert to authenticated with check (reporter = auth.uid() and public.is_active_member());
+create policy rep_admin_read on public.reports for select to authenticated using (public.is_admin_aal2());
+
+grant select, insert on public.messages to authenticated;
+grant update (deleted_at) on public.messages to authenticated;
+create policy msg_select on public.messages for select to authenticated using (public.is_conv_member(conversation_id));
+create policy msg_insert on public.messages for insert to authenticated with check (
+  sender_id = auth.uid() and public.is_conv_member(conversation_id) and not public.dm_blocked(conversation_id)
+  and exists (select 1 from devices d where d.id = sender_device_id and d.user_id = auth.uid() and d.revoked_at is null and d.approved_at is not null));
+create policy msg_delete_everyone on public.messages for update to authenticated
+  using (sender_id = auth.uid() and public.is_conv_member(conversation_id)) with check (sender_id = auth.uid());
+
+grant select, insert on public.message_envelopes to authenticated;
+create policy env_select on public.message_envelopes for select to authenticated using (
+  public.is_active_member() and exists (select 1 from devices d where d.id = recipient_device_id and d.user_id = auth.uid() and d.revoked_at is null));
+create policy env_insert on public.message_envelopes for insert to authenticated with check (
+  exists (select 1 from messages m where m.id = message_id and m.sender_id = auth.uid())
+  and exists (select 1 from messages m join conversation_members cm on cm.conversation_id = m.conversation_id
+              join devices d on d.user_id = cm.user_id
+              where m.id = message_id and d.id = recipient_device_id and cm.left_at is null and d.revoked_at is null));
+
+grant select, insert, update on public.message_receipts to authenticated;
+create policy rcpt_select on public.message_receipts for select to authenticated using (
+  user_id = auth.uid() or exists (select 1 from messages m where m.id = message_id and m.sender_id = auth.uid()));
+create policy rcpt_insert on public.message_receipts for insert to authenticated with check (
+  user_id = auth.uid() and exists (select 1 from messages m where m.id = message_id and public.is_conv_member(m.conversation_id)));
+create policy rcpt_update on public.message_receipts for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+grant select, insert, delete on public.message_hidden to authenticated;
+create policy hid_own on public.message_hidden for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+grant select, insert on public.attachments to authenticated;
+create policy att_select on public.attachments for select to authenticated
+  using (exists (select 1 from messages m where m.id = message_id and public.is_conv_member(m.conversation_id)));
+create policy att_insert on public.attachments for insert to authenticated
+  with check (exists (select 1 from messages m where m.id = message_id and m.sender_id = auth.uid()));
+
+grant select on public.calls to authenticated;
+create policy calls_select on public.calls for select to authenticated using (public.is_conv_member(conversation_id));
+
+grant select on public.app_settings to authenticated;
+grant update (theme, ringtone_path, updated_by, updated_at) on public.app_settings to authenticated;
+create policy set_read  on public.app_settings for select to authenticated using (public.is_active_member());
+create policy set_admin on public.app_settings for update to authenticated using (public.is_admin_aal2()) with check (public.is_admin_aal2());
+
+grant select, insert, delete on public.backups to authenticated;
+create policy bk_own on public.backups for all to authenticated
+  using (user_id = auth.uid() and public.is_active_member()) with check (user_id = auth.uid() and public.is_active_member());
+
+-- ---------- Realtime Authorization (private channels: conv:<id>, call:<id>, user:<uid>) ----------
+create function public.topic_ok(t text) returns boolean
+language plpgsql stable security definer set search_path = public as $$
+declare cid uuid;
+begin
+  if t = 'user:' || auth.uid()::text then return public.is_active_member(); end if;
+  if t ~ '^conv:[0-9a-f-]{36}$' then return public.is_conv_member(split_part(t, ':', 2)::uuid); end if;
+  if t ~ '^call:[0-9a-f-]{36}$' then
+    cid := split_part(t, ':', 2)::uuid;
+    return exists (select 1 from calls c where c.id = cid and public.is_conv_member(c.conversation_id) and c.state in ('ringing','active'));
+  end if;
+  return false;
+exception when others then return false;
+end $$;
+create policy rt_select on realtime.messages for select to authenticated using (public.topic_ok(realtime.topic()));
+create policy rt_insert on realtime.messages for insert to authenticated with check (public.topic_ok(realtime.topic()));
+
+alter publication supabase_realtime add table public.messages, public.message_envelopes,
+  public.message_receipts, public.app_settings, public.calls, public.conversation_members;
+
+-- ---------- Storage: private buckets, membership-checked ----------
+insert into storage.buckets (id, name, public, file_size_limit) values
+  ('media','media',false,26214400), ('backups','backups',false,52428800),
+  ('dp','dp',false,2097152), ('ringtones','ringtones',false,1048576)
+on conflict (id) do nothing;
+
+create function public.storage_conv_ok(obj_name text) returns boolean
+language plpgsql stable security definer set search_path = public as $$
+declare seg text := split_part(obj_name, '/', 1);
+begin
+  if seg !~ '^[0-9a-f-]{36}$' then return false; end if;
+  return public.is_conv_member(seg::uuid);
+end $$;
+
+create policy st_media_read   on storage.objects for select to authenticated using (bucket_id = 'media' and public.storage_conv_ok(name));
+create policy st_media_insert on storage.objects for insert to authenticated with check (bucket_id = 'media' and public.storage_conv_ok(name));
+create policy st_media_delete on storage.objects for delete to authenticated using (bucket_id = 'media' and owner_id = auth.uid()::text and public.is_active_member());
+
+create policy st_bk_own on storage.objects for all to authenticated
+  using (bucket_id = 'backups' and split_part(name,'/',1) = auth.uid()::text and public.is_active_member())
+  with check (bucket_id = 'backups' and split_part(name,'/',1) = auth.uid()::text and public.is_active_member());
+
+create policy st_dp_read   on storage.objects for select to authenticated using (bucket_id = 'dp' and public.is_active_member());
+create policy st_dp_write  on storage.objects for insert to authenticated with check (bucket_id = 'dp' and split_part(name,'/',1) = auth.uid()::text and public.is_active_member());
+create policy st_dp_update on storage.objects for update to authenticated using (bucket_id = 'dp' and split_part(name,'/',1) = auth.uid()::text);
+
+create policy st_ring_read  on storage.objects for select to authenticated using (bucket_id = 'ringtones' and public.is_active_member());
+create policy st_ring_admin on storage.objects for all to authenticated using (bucket_id = 'ringtones' and public.is_admin_aal2()) with check (bucket_id = 'ringtones' and public.is_admin_aal2());
